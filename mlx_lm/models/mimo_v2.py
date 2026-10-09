@@ -14,6 +14,12 @@ from .pipeline import PipelineMixin
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
 
+# Largest attention-score tensor (heads x queries x keys) one attention call may
+# build. MiMo's query and value head sizes differ, so MLX cannot use its fused
+# attention kernel and builds the whole tensor; with 128 heads and a long context
+# that is tens of GB for a single prefill chunk.
+MAX_SCORE_BYTES = 4 << 30
+
 
 @dataclass
 class ModelArgs(BaseModelArgs):
@@ -136,15 +142,44 @@ class Attention(nn.Module):
             queries = self.rope(queries)
             keys = self.rope(keys)
 
-        output = scaled_dot_product_attention(
-            queries,
-            keys,
-            values,
-            cache=cache,
-            scale=self.scale,
-            mask=mask,
-            sinks=self.attention_sink_bias,
-        )
+        # Queries per attention call. Only the plain causal case is split
+        # ("causal" is the only string mask; windowed layers get an array).
+        step = L
+        if isinstance(mask, str) and isinstance(keys, mx.array):
+            score_row_bytes = self.n_heads * keys.shape[2] * queries.dtype.size
+            step = max(1, MAX_SCORE_BYTES // score_row_bytes)
+
+        if step >= L:
+            output = scaled_dot_product_attention(
+                queries,
+                keys,
+                values,
+                cache=cache,
+                scale=self.scale,
+                mask=mask,
+                sinks=self.attention_sink_bias,
+            )
+        else:
+            # Each query row attends on its own, so slices of the queries give
+            # the same result. A slice only needs the keys up to its last query.
+            outputs = []
+            for start in range(0, L, step):
+                stop = min(start + step, L)
+                n_keys = keys.shape[2] - L + stop
+                outputs.append(
+                    scaled_dot_product_attention(
+                        queries[:, :, start:stop],
+                        keys[:, :, :n_keys],
+                        values[:, :, :n_keys],
+                        cache=cache,
+                        scale=self.scale,
+                        mask="causal",
+                        sinks=self.attention_sink_bias,
+                    )
+                )
+                # Evaluate now so this slice's scores are freed before the next.
+                mx.eval(outputs[-1])
+            output = mx.concatenate(outputs, axis=2)
         return self.o_proj(output.swapaxes(1, 2).reshape(B, L, -1))
 
 
